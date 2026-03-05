@@ -19,9 +19,21 @@
 /*
         Version Information
 */
-#define DRIVER_VERSION "v1.6.12"
+#define DRIVER_VERSION "v1.6.12-delila1"
 #define DRIVER_AUTHOR "CAEN Computing Division  support.computing@caen.it"
 #define DRIVER_DESC "CAEN A3818 PCI Express CONET2 board driver"
+
+/*
+ * DELILA patches (2026-02-24):
+ *   1. Increase app_dma_in buffer from 1MB to 16MB (prevent overflow at high event rates)
+ *   2. Add bounds check in a3818_dispatch_pkt before memcpy
+ *   3. Fix off-by-one in interrupt handler loop (i=NumOfLink -> i=NumOfLink-1)
+ *   4. Fix semaphore leak in IOCTL_SEND err_send path
+ *   5. Fix unbalanced semaphore up() in IOCTL_RECV
+ *   6. Handle 0xFFFFFFFF PCIe read in recv_pkt (prevent writel to dead device)
+ * See docs/a3818_driver_analysis.md for full analysis.
+ */
+#define APP_DMA_IN_SIZE (16*1024*1024)
 
 #ifdef CONFIG_SMP
 #  define __SMP__
@@ -383,6 +395,7 @@ static int a3818_recv_pkt(struct a3818_state *s, int slave, int opt_link, int *s
 	int i;
 	uint32_t tr_stat;
 	int startDMA = 0;
+	int deviceDead = 0; /* DELILA patch: track PCIe device failure */
 //	DISABLE_RX_INT(opt_link);
 	DPRINTK("a3818_recv_pkt: DISABLE_RX_INT\n");
 
@@ -392,7 +405,8 @@ static int a3818_recv_pkt(struct a3818_state *s, int slave, int opt_link, int *s
 		for( i = 0; i < 15; i++ ) {
 			tr_stat = readl(s->baseaddr[opt_link] + A3818_LINK_TRS);
 			if( tr_stat == 0xFFFFFFFF ) {
-				DPRINTK("rcv-pkt: Error: tr_stat = %x, i= %d\n", s->tr_stat[opt_link],i);
+				printk(KERN_ERR PFX "rcv-pkt: PCIe device failure (0xFFFFFFFF) on link %d\n", opt_link);
+				deviceDead = 1;
 				break;
 			}
 			else if( tr_stat & 0xFFFF0000 ) {
@@ -407,6 +421,10 @@ static int a3818_recv_pkt(struct a3818_state *s, int slave, int opt_link, int *s
 	DPRINTK("rcv-pkt: tr_stat = %x, i= %d\n", tr_stat,i);
 	spin_unlock_irq( &s->DataLinklock[opt_link]);
 
+	/* DELILA patch: do NOT touch hardware if device is gone */
+	if (deviceDead) {
+		return -EIO;
+	}
 
 	if (!startDMA) ENABLE_RX_INT(opt_link);
 
@@ -545,6 +563,12 @@ static void a3818_dispatch_pkt(struct a3818_state *s, int opt_link)
 				(slave < MAX_V2718) && (pkt_sz >= 0) &&
 				(pkt_sz <= 0x100) ) {
 
+			/* DELILA patch: prevent buffer overflow */
+			if( pos + pkt_sz * 2 > APP_DMA_IN_SIZE ) {
+				printk(KERN_ERR PFX "disp_pkt: Buffer overflow prevented on link %d slave %d (pos=%d, need=%d, limit=%d)\n",
+					opt_link, slave, pos, pkt_sz * 2, APP_DMA_IN_SIZE);
+				break;
+			}
 			// Copy of data ready
 			memcpy(&(iobuf[pos]), &(buff_dma_in[i]), pkt_sz * 2);
 			ResidualDMASize -= pkt_sz * 2;
@@ -1066,17 +1090,16 @@ err_comm:
 			}
 			if( copy_to_user(comm.in_buf, s->app_dma_in[opt_link][slave], comm.in_count) ) {
 				ret = -EFAULT;
-				up(&s->ioctl_lock[opt_link]);
-				break;
 			}
-			up(&s->ioctl_lock[opt_link]);
+			/* DELILA patch: unified semaphore release for both success and error paths */
 err_send:
+			up(&s->ioctl_lock[opt_link]);
 			break;
 		case IOCTL_RECV:
 			if ((s->NumOfLink == 0) && (s->TypeOfBoard == A3818RAW || s->TypeOfBoard == A3818DIGIT ))
 				return -EFAULT; // To avoid to use optical link of a not initialized board
 			ret = a3818_recv_pkt(s, slave, opt_link, (int *)arg);
-			up(&s->ioctl_lock[opt_link]);
+			/* DELILA patch: removed unbalanced up() — no down() was called for IOCTL_RECV */
 			if( ret < 0 ) {
 				ret = -EFAULT;
 			}
@@ -1177,7 +1200,7 @@ static irqreturn_t a3818_interrupt(int irq, void *dev_id)
 			s = s->next;
 			continue; 
 		}
-		for( i = s->NumOfLink; i > -1 ; i-- ) {
+		for( i = s->NumOfLink - 1; i >= 0 ; i-- ) { /* DELILA patch: fix off-by-one */
 			if( app & (A3818_DMISCCS_RDDMA_DONE0 << i) ) {
 				//DMA controller reset
 				writel(A3818_RES_DMAINT, s->baseaddr[i] + A3818_DMACSR_S);
@@ -1446,7 +1469,7 @@ static int a3818_init_board(struct pci_dev *pcidev, int index) {
 
 	for( i = 0; i < s->NumOfLink; i++ )
 	  for( j = 0; j  < MAX_V2718; j++ ) {
-		  s->app_dma_in[i][j] = (u8 *)vmalloc(1024*1024);
+		  s->app_dma_in[i][j] = (u8 *)vmalloc(APP_DMA_IN_SIZE); /* DELILA patch: 1MB -> 16MB */
 		  if( s->app_dma_in[i][j]== 0) {
 			  printk("unable to alloc vmalloc buffers\n");
 			  goto err_app_dma_in;
