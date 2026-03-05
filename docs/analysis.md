@@ -308,3 +308,106 @@ Interim measures if the driver cannot be patched:
 - Shorten readout interval to keep per-cycle data under 1MB (50ms or less recommended)
 - Disable waveform acquisition at high rates
 - Adjust EventsPerInterrupt / BLT_SIZE to reduce DMA transfer frequency
+
+---
+
+## Bugs Discovered in v1.6.12-delila3 (2026-03-05)
+
+### Bug 8: [HIGH] Missing opt_link Validation in a3818_ioctl
+
+**Location:** `a3818_ioctl()` (a3818.c:885-888)
+
+```c
+slave = minor & 0x7;
+opt_link = (minor >> 3) & 0x7;
+// ★ opt_link can be 0-7, but arrays are MAX_OPT_LINK (5) elements!
+s->ioctls[opt_link]++;  // OOB write if opt_link >= 5
+```
+
+**Mechanism:**
+- `opt_link` is derived from the minor number and can range 0-7
+- Arrays indexed by `opt_link` (`ioctls[]`, `ioctl_lock[]`, `DataLinklock[]`, `baseaddr[]`, etc.) have `MAX_OPT_LINK` (5) elements
+- `a3818_open()` validates against `NumOfLink` (max 4), but for `A3818RAW` boards (`NumOfLink == 0`), the check is skipped entirely
+- Any userspace process with access to the device node can trigger out-of-bounds access
+
+**Fix:** Added `if (opt_link >= MAX_OPT_LINK) return -EINVAL;` before first use.
+
+### Bug 9: [HIGH] Missing comm.out_count Validation in IOCTL_COMM/IOCTL_SEND
+
+**Location:** `a3818_ioctl()` IOCTL_COMM (a3818.c:~911) and IOCTL_SEND (a3818.c:~1092)
+
+```c
+down(&s->ioctl_lock[opt_link]);
+// ★ No validation of comm.out_count!
+copy_from_user(&(s->buff_dma_out[opt_link][slave][1]), comm.out_buf, comm.out_count);
+```
+
+**Mechanism:**
+- `buff_dma_out` is allocated with `A3818_MAX_PKT_SZ` (128KB) via `dma_alloc_coherent`
+- Write starts at `[1]` (offset 4 bytes), so max safe copy is `A3818_MAX_PKT_SZ - 4`
+- `comm.out_count` comes from userspace without any bounds check
+- A value exceeding 128KB causes heap overflow into adjacent DMA-coherent memory
+
+**Fix:** Added size validation before `copy_from_user`: reject if `out_count < 0` or `> A3818_MAX_PKT_SZ - sizeof(uint32_t)`.
+
+### Bug 10: [MEDIUM] Unbounded copy_to_user in IOCTL_COMM/IOCTL_SEND
+
+**Location:** `a3818_ioctl()` IOCTL_COMM (a3818.c:~969) and IOCTL_SEND (a3818.c:~1132)
+
+```c
+// IOCTL_COMM: copies ndata_app_dma_in (up to 16MB) without checking user buffer size
+copy_to_user(comm.in_buf, s->app_dma_in[...], s->ndata_app_dma_in[...]);
+
+// IOCTL_SEND: copies comm.in_count bytes without checking available data
+copy_to_user(comm.in_buf, s->app_dma_in[...], comm.in_count);
+```
+
+**Impact:**
+- IOCTL_COMM: user buffer overflow if `ndata_app_dma_in` exceeds user's `in_buf` allocation
+- IOCTL_SEND: kernel information leak if `comm.in_count` exceeds actual received data (reads uninitialized vmalloc memory)
+
+**Fix:** Cap copy size to `min(available_data, user_requested_size)` in both paths.
+
+### Bug 11: [MEDIUM] DMAInProgress Race Condition in Interrupt Handler
+
+**Location:** `a3818_interrupt()` LOC_INT path (a3818.c:~1280-1291)
+
+```c
+// In ISR, only CardLock is held:
+if( !(s->DMAInProgress[i]) ) {
+    // ...
+    a3818_handle_rx_pkt(s, i, 0);  // ★ writes DMAInProgress[i] = 1 at line 506
+}
+
+// In recv_pkt, only DataLinklock is held:
+spin_lock_irq(&s->DataLinklock[opt_link]);
+if( !s->DMAInProgress[opt_link] && ... ) {  // ★ reads DMAInProgress
+```
+
+**Mechanism:**
+- `a3818_handle_rx_pkt()` writes `DMAInProgress[i] = 1` (line 506)
+- When called from ISR LOC_INT path, only `CardLock` protects this write
+- `a3818_recv_pkt()` reads `DMAInProgress` under `DataLinklock` (line 406)
+- Different locks on the same variable → TOCTOU race
+- Both paths could enter `a3818_handle_rx_pkt()` concurrently, corrupting hardware state
+
+**Fix:** Wrap `a3818_handle_rx_pkt()` call in ISR LOC_INT path with `DataLinklock`, matching the existing pattern used for `a3818_dispatch_pkt()` in the DMA-done path. Lock nesting `CardLock → DataLinklock` is already established safe.
+
+### Bug 12: [LOW] Non-standard Error Codes in a3818_init_board
+
+**Location:** `a3818_init_board()` error labels (a3818.c:~1546-1597)
+
+The function used custom error codes (-1 through -9) instead of standard kernel error codes (`-ENOMEM`, `-ENODEV`, `-EBUSY`, `-EIO`). Also, `iounmap()` was called without NULL check in `err_ibuf`, which could dereference NULL for partially mapped links.
+
+**Fix:** Replaced all custom codes with standard equivalents. Added `if (s->baseaddr[i])` check before `iounmap`. Replaced Italian comment at A3818RAW fallback with English explanation.
+
+### Bug 13: [LOW] Missing pci_disable_device in Cleanup Paths
+
+**Location:** `a3818_init_board()` and `ReleaseBoards()` (a3818.c)
+
+`pci_enable_device()` is called at the start of `a3818_init_board()`, but `pci_disable_device()` was never called in any error path or in `ReleaseBoards()`. This leaks the PCI device reference, preventing proper cleanup on module unload or error recovery.
+
+**Fix:** Added `pci_disable_device()` in:
+- Early return paths (invalid IRQ, kmalloc failure)
+- `err_kmalloc` label (covers all late error paths)
+- `ReleaseBoards()` before `kfree(s)`

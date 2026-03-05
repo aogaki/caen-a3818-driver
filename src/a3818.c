@@ -19,20 +19,31 @@
 /*
         Version Information
 */
-#define DRIVER_VERSION "v1.6.12-delila1"
+#define DRIVER_VERSION "v1.6.12-delila3"
 #define DRIVER_AUTHOR "CAEN Computing Division  support.computing@caen.it"
 #define DRIVER_DESC "CAEN A3818 PCI Express CONET2 board driver"
 
 /*
- * DELILA patches (v1.6.12-delila2, 2026-03-05):
+ * DELILA patches — see docs/analysis.md for full analysis.
+ *
+ * v1.6.12-delila1 (2026-02-24):
  *   1. Increase app_dma_in buffer from 1MB to 16MB (prevent overflow at high event rates)
  *   2. Add bounds check in a3818_dispatch_pkt before memcpy
  *   3. Fix off-by-one in interrupt handler loop (i=NumOfLink -> i=NumOfLink-1)
  *   4. Fix semaphore leak in IOCTL_SEND err_send path
  *   5. Fix unbalanced semaphore up() in IOCTL_RECV
  *   6. Handle 0xFFFFFFFF PCIe read in recv_pkt (prevent writel to dead device)
- *   7. Fix scheduling-while-atomic in a3818_open: spin_lock→mutex for GTP reset (msleep safe)
- * See docs/a3818_driver_analysis.md for full analysis.
+ *
+ * v1.6.12-delila2 (2026-03-05):
+ *   7. Fix scheduling-while-atomic in a3818_open: spin_lock->mutex for GTP reset
+ *
+ * v1.6.12-delila3 (2026-03-05):
+ *   8. Validate opt_link bounds in a3818_ioctl (prevent OOB array access)
+ *   9. Validate comm.out_count before copy_from_user in IOCTL_COMM/IOCTL_SEND
+ *  10. Cap copy_to_user size to min(available, requested) in IOCTL_COMM/IOCTL_SEND
+ *  11. Protect DMAInProgress write in ISR with DataLinklock (race fix)
+ *  12. Standardize error codes in a3818_init_board + NULL check before iounmap
+ *  13. Add pci_disable_device in cleanup/error paths
  */
 #define APP_DMA_IN_SIZE (16*1024*1024)
 
@@ -874,6 +885,11 @@ static int a3818_ioctl(struct inode *inode,struct file *file,unsigned int cmd, u
   slave = minor & 0x7;
   opt_link = (minor >> 3) & 0x7;
 
+  /* DELILA patch: validate opt_link to prevent OOB array access.
+     For A3818RAW boards (NumOfLink==0), a3818_open() skips link validation. */
+  if (opt_link >= MAX_OPT_LINK)
+      return -EINVAL;
+
   s->ioctls[opt_link]++;
 
   switch (cmd) {
@@ -892,6 +908,14 @@ static int a3818_ioctl(struct inode *inode,struct file *file,unsigned int cmd, u
 				break;
 			}
 			down(&s->ioctl_lock[opt_link]);
+			/* DELILA patch: validate out_count to prevent heap overflow.
+			   buff_dma_out is A3818_MAX_PKT_SZ bytes, write starts at [1] (4 bytes in). */
+			if (comm.out_count < 0 ||
+			    (size_t)comm.out_count > A3818_MAX_PKT_SZ - sizeof(uint32_t)) {
+				ret = -EINVAL;
+				up(&s->ioctl_lock[opt_link]);
+				break;
+			}
 			if( copy_from_user(&(s->buff_dma_out[opt_link][slave][1]), comm.out_buf, comm.out_count) > 0) {
 				ret = -EFAULT;
 				up(&s->ioctl_lock[opt_link]);
@@ -942,9 +966,15 @@ static int a3818_ioctl(struct inode *inode,struct file *file,unsigned int cmd, u
 			}
 			}
 			put_user(s->rx_status[opt_link][slave], comm.status);
-			if( copy_to_user(comm.in_buf, s->app_dma_in[opt_link][slave], s->ndata_app_dma_in[opt_link][slave]) > 0) {
-				ret = -EFAULT;
-				goto err_comm;
+			/* DELILA patch: cap copy size to min(available, user buffer) */
+			{
+				int copy_sz = s->ndata_app_dma_in[opt_link][slave];
+				if (comm.in_count >= 0 && copy_sz > comm.in_count)
+					copy_sz = comm.in_count;
+				if( copy_to_user(comm.in_buf, s->app_dma_in[opt_link][slave], copy_sz) > 0) {
+					ret = -EFAULT;
+					goto err_comm;
+				}
 			}
 			
 err_comm:
@@ -1073,6 +1103,13 @@ err_comm:
 				break;
 			}
 			down(&s->ioctl_lock[opt_link]);
+			/* DELILA patch: validate out_count (same as IOCTL_COMM) */
+			if (comm.out_count < 0 ||
+			    (size_t)comm.out_count > A3818_MAX_PKT_SZ - sizeof(uint32_t)) {
+				ret = -EINVAL;
+				up(&s->ioctl_lock[opt_link]);
+				break;
+			}
 			if( copy_from_user(&(s->buff_dma_out[opt_link][slave][1]), comm.out_buf, comm.out_count) > 0) {
 				ret = -EFAULT;
 				up(&s->ioctl_lock[opt_link]);
@@ -1098,8 +1135,15 @@ err_comm:
 					goto err_send;
 				}
 			}
-			if( copy_to_user(comm.in_buf, s->app_dma_in[opt_link][slave], comm.in_count) ) {
-				ret = -EFAULT;
+			/* DELILA patch: cap copy size to available data */
+			{
+				int copy_sz = comm.in_count;
+				int avail = s->ndata_app_dma_in[opt_link][slave];
+				if (copy_sz < 0) copy_sz = 0;
+				if (copy_sz > avail) copy_sz = avail;
+				if( copy_to_user(comm.in_buf, s->app_dma_in[opt_link][slave], copy_sz) ) {
+					ret = -EFAULT;
+				}
 			}
 			/* DELILA patch: unified semaphore release for both success and error paths */
 err_send:
@@ -1242,7 +1286,13 @@ static irqreturn_t a3818_interrupt(int irq, void *dev_id)
 					//DPRINTK("trstat = %#lx\n", (long)tr_stat);
 					if( tr_stat & 0xFFFF0000 ) {
 						s->tr_stat[i] = tr_stat;
+						/* DELILA patch: protect DMAInProgress write inside
+						   handle_rx_pkt with DataLinklock, matching the lock
+						   used in recv_pkt. CardLock->DataLinklock nesting
+						   is already established safe. */
+						spin_lock( &s->DataLinklock[i]);
 						a3818_handle_rx_pkt(s, i, 0);
+						spin_unlock( &s->DataLinklock[i]);
 					}
 				}
 			}
@@ -1270,7 +1320,7 @@ static int a3818_init_board(struct pci_dev *pcidev, int index) {
 
 	if( pci_enable_device(pcidev) ) {
 		printk("init_board: pci_enable_device failed");
-		return -1;
+		return -ENODEV;
 	}
 
 ////////////////////////////////////
@@ -1296,7 +1346,8 @@ static int a3818_init_board(struct pci_dev *pcidev, int index) {
 
 	if( pcidev->irq == 0 ) {
 		printk("Invalid IRQ\n");
-		return -1;
+		pci_disable_device(pcidev);
+		return -ENODEV;
 	}
 	
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,26)
@@ -1307,7 +1358,8 @@ static int a3818_init_board(struct pci_dev *pcidev, int index) {
 	s = kmalloc(sizeof(*s), GFP_KERNEL);
 	if( !s ) {
 		printk(KERN_ERR PFX "out of memory\n");
-		return -2;
+		pci_disable_device(pcidev);
+		return -ENOMEM;
 	}
 
 	memset(s, 0, sizeof(struct a3818_state));
@@ -1494,34 +1546,37 @@ static int a3818_init_board(struct pci_dev *pcidev, int index) {
 	return ret;
 
 err_app_dma_in:
-	if( !ret ) ret = -9;
+	if( !ret ) ret = -ENOMEM;
 	for( i = 0; i < s->NumOfLink; i++ )
 	  for( j  = 0; j < MAX_V2718; j++)
 		  if (s->app_dma_in[i][j]) vfree( s->app_dma_in[i][j]);
 
 err_irq:
 err_obuf:
-	if( !ret ) ret = -8;
+	if( !ret ) ret = -ENOMEM;
 	for( j = 0; j < s->NumOfLink; j++ )
 	  for( i = 0; i < MAX_V2718; i++ )
 		  if( (s->buff_dma_out[j][i]) )
 			  dma_free_coherent(&pcidev->dev, A3818_MAX_PKT_SZ, s->buff_dma_out[j][i], s->phy_dma_addr_out[j][i]);
 
 err_ibuf:
-  if( !ret ) ret = -7;
+	if( !ret ) ret = -ENOMEM;
 	for( i = 0; i < s->NumOfLink; i++ ) {
 	  if( s->buff_dma_in[i] )
 		  dma_free_coherent(&pcidev->dev, A3818_MAX_PKT_SZ, s->buff_dma_in[i], s->phy_dma_addr_in[i]);
-	  iounmap(s->baseaddr[i]);
+	  if( s->baseaddr[i] )  /* DELILA patch: NULL check before iounmap */
+		  iounmap(s->baseaddr[i]);
 	}
 
 err_region_mem:
-	if( !ret ) ret = -6;
+	if( !ret ) ret = -EBUSY;
 	for( j = z - 1; j >= 0; j-- )
 	  release_mem_region(s->phys[j], A3818_REGION_SIZE);
 
 err_common_region_map:
-	if( s->TypeOfBoard == A3818RAW ) {  // a3818 sputtanata ma si sitorna OK x consentire l'accesso al registro comune e ripristinarla
+	/* Intentional: corrupted A3818 returns success to allow common register
+	   access for firmware recovery. Cleaned up by ReleaseBoards() on unload. */
+	if( s->TypeOfBoard == A3818RAW ) {
 		s->NumOfLink = 0;
 		s->CardNumber = index;
 		s->timeout= msecs_to_jiffies( 15000);
@@ -1531,16 +1586,17 @@ err_common_region_map:
 		return 0;
 	}
 	a3818_unregister_proc();
-	if( !ret ) ret = -5;
+	if( !ret ) ret = -EIO;
 	iounmap(s->baseaddr[A3818_COMMON_REG]);
 
 err_common_region_mem:
-	if( !ret ) ret = -4;
+	if( !ret ) ret = -EBUSY;
 
 	release_mem_region(s->phys[A3818_COMMON_REG], A3818_REGION_SIZE);
 
 err_kmalloc:
-	if( !ret ) ret = -3;
+	if( !ret ) ret = -ENOMEM;
+	pci_disable_device(pcidev);  /* DELILA patch: match pci_enable_device */
 	kfree(s);
 
   return ret;
@@ -1677,6 +1733,7 @@ static void ReleaseBoards(void)
 		if (s->NumOfLink == 0) {
 			device_destroy(a3818_class, MKDEV(s->major, (s->CardNumber << 6)));
 		}
+		pci_disable_device(s->pcidev);  /* DELILA patch: match pci_enable_device */
         kfree(s);
 	}
 	a3818_unregister_proc();
