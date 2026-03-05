@@ -1,81 +1,81 @@
-# CAEN A3818 PCIe CONET2 ドライバ (v1.6.12) カーネルパニック解析レポート
+# CAEN A3818 PCIe CONET2 Driver (v1.6.12) Kernel Panic Analysis Report
 
-**解析日:** 2026-02-24
-**対象:** `external/a3818_linux_driver-v1.6.12/src/a3818.c`
-**解析ツール:** Gemini Deep Research + 静的コード解析 + バッファオーバーフロー計算
+**Analysis date:** 2026-02-24
+**Target:** `external/a3818_linux_driver-v1.6.12/src/a3818.c`
+**Tools used:** Gemini Deep Research + static code analysis + buffer overflow calculations
 
 ## Executive Summary
 
-CAEN A3818 PCIe CONET2 ドライバ (v1.6.12) には、高イベントレート時にカーネルパニックを引き起こす複数の重大なバグが存在する。最も可能性が高い原因は、`a3818_dispatch_pkt()` 内の **1MB vmalloc バッファに対する境界チェックの欠如** によるヒープ破壊である。PSD ファームウェアで 700K events/s を超えるレートでは、1回のリードアウトで 1MB を超えるデータが蓄積し、vmalloc ガードページへの書き込みが割り込みコンテキスト内で発生してカーネルパニックとなる。
+The CAEN A3818 PCIe CONET2 driver (v1.6.12) contains multiple critical bugs that cause kernel panics at high event rates. The most likely root cause is **heap corruption due to missing bounds checking on the 1MB vmalloc buffer** in `a3818_dispatch_pkt()`. With PSD firmware at rates exceeding 700K events/s, a single readout cycle accumulates more than 1MB of data, causing a write to the vmalloc guard page within interrupt context, resulting in a kernel panic.
 
 ---
 
-## 発見されたバグ（深刻度順）
+## Discovered Bugs (by severity)
 
-### Bug 1: [CRITICAL] `app_dma_in` バッファオーバーフロー
+### Bug 1: [CRITICAL] `app_dma_in` Buffer Overflow
 
-**場所:** `a3818_dispatch_pkt()` (a3818.c:549)
-**高レート時カーネルパニックの最有力原因**
+**Location:** `a3818_dispatch_pkt()` (a3818.c:549)
+**Most likely cause of kernel panic at high rates**
 
 ```c
 pos = s->pos_app_dma_in[opt_link][slave];
-// ★ pos が 1MB を超えていないか一切チェックしていない！
+// ★ No check whether pos exceeds 1MB!
 memcpy(&(iobuf[pos]), &(buff_dma_in[i]), pkt_sz * 2);
 s->pos_app_dma_in[opt_link][slave] += pkt_sz * 2;
 ```
 
-**メカニズム:**
-- `app_dma_in` は **1MB** (`vmalloc(1024*1024)`, line 1449)
-- 個別パケットは `pkt_sz <= 0x100` (512バイト) だが、**累積チェックなし**
-- 複数の DMA 転送（各最大 128KB）がひとつの IOCTL_COMM レスポンスに蓄積される
-- `pos_app_dma_in` は IOCTL_COMM 完了時（`err_comm` ラベル, line 917）でのみリセットされる
+**Mechanism:**
+- `app_dma_in` is **1MB** (`vmalloc(1024*1024)`, line 1449)
+- Individual packets are `pkt_sz <= 0x100` (512 bytes), but **no cumulative bounds check**
+- Multiple DMA transfers (up to 128KB each) accumulate into a single IOCTL_COMM response
+- `pos_app_dma_in` is only reset when IOCTL_COMM completes (`err_comm` label, line 917)
 
-**オーバーフロー閾値の計算:**
+**Overflow threshold calculations:**
 
-| リードアウト間隔 | PSD (20B/evt) でオーバーフローするレート | PHA (18B/evt) |
+| Readout interval | Rate to overflow with PSD (20B/evt) | PHA (18B/evt) |
 |:---:|:---:|:---:|
 | 50ms | ~1,049K events/s | ~1,165K events/s |
 | 100ms | **~524K events/s** | ~582K events/s |
 | 200ms | ~262K events/s | ~291K events/s |
 | 500ms | ~105K events/s | ~116K events/s |
 
-波形データ付き（512サンプル）の場合、閾値は **~10K events/s** まで低下する。
+With waveform data (512 samples), the threshold drops to **~10K events/s**.
 
-**実測シナリオ:**
-- PSD1 で 700K events/s → 100ms リードアウトで約 1.4MB → 1MB バッファを **40% 超過**
-- vmalloc はガードページを持つため、1MB を超えた memcpy → ページフォルト
-- 割り込みコンテキスト内のページフォルトは **即座にカーネルパニック**
+**Observed scenario:**
+- PSD1 at 700K events/s → ~1.4MB per 100ms readout → **40% over** the 1MB buffer
+- vmalloc has guard pages, so memcpy beyond 1MB → page fault
+- Page fault in interrupt context → **immediate kernel panic**
 
-**パニックのフロー:**
+**Panic flow:**
 ```
-高イベントレート → DMA 転送が高頻度
-→ 割り込みハンドラが a3818_dispatch_pkt を頻繁に呼ぶ
-→ app_dma_in (1MB) に蓄積、pos_app_dma_in が増大
-→ ユーザースペースが読み出す前に 1MB を超過
-→ memcpy が vmalloc ガードページに書き込み
-→ 割り込みコンテキストでのページフォルト
+High event rate → frequent DMA transfers
+→ Interrupt handler calls a3818_dispatch_pkt frequently
+→ Data accumulates in app_dma_in (1MB), pos_app_dma_in grows
+→ Exceeds 1MB before userspace reads it out
+→ memcpy writes to vmalloc guard page
+→ Page fault in interrupt context
 → ★ KERNEL PANIC ★
 ```
 
-### Bug 2: [HIGH] 割り込みハンドラの off-by-one
+### Bug 2: [HIGH] Off-by-one in Interrupt Handler
 
-**場所:** `a3818_interrupt()` (a3818.c:1180)
+**Location:** `a3818_interrupt()` (a3818.c:1180)
 
 ```c
 for( i = s->NumOfLink; i > -1 ; i-- ) {
-    // ★ NumOfLink (e.g., 4) から開始 — 0-indexed 配列なのに！
+    // ★ Starts from NumOfLink (e.g., 4) — but the array is 0-indexed!
     if( app & (A3818_DMISCCS_RDDMA_DONE0 << i) ) {
         writel(A3818_RES_DMAINT, s->baseaddr[i] + A3818_DMACSR_S);
-        // baseaddr[NumOfLink] は ioremap されていない（NULL）
+        // baseaddr[NumOfLink] is not ioremap'd (NULL)
 ```
 
-**影響:**
-- 4-link カード: `NumOfLink=4` → `baseaddr[4]` は未マッピング (memset で 0 初期化 = NULL)
-- `DataLinklock[4]` は未初期化（配列サイズ `MAX_OPT_LINK=5` なので配列内だが spin_lock_init されていない）
-- 通常は bit20 (`RDDMA_DONE4`) がセットされないため発動しないが、ハードウェアエラー時やノイズ時にセットされる可能性あり
-- 発動した場合: NULL ポインタ逆参照 → カーネルパニック
+**Impact:**
+- 4-link card: `NumOfLink=4` → `baseaddr[4]` is unmapped (zeroed by memset = NULL)
+- `DataLinklock[4]` is uninitialized (within array bounds since `MAX_OPT_LINK=5`, but spin_lock_init was not called)
+- Normally bit20 (`RDDMA_DONE4`) is never set, so this does not trigger, but it could on hardware errors or noise
+- If triggered: NULL pointer dereference → kernel panic
 
-**配列サイズ確認:**
+**Array size reference:**
 ```c
 // a3818.h
 #define MAX_OPT_LINK (0x05)
@@ -85,101 +85,101 @@ spinlock_t     DataLinklock[MAX_OPT_LINK];  // [5] — index 0-4
 unsigned int   DMAInProgress[MAX_OPT_LINK]; // [5] — index 0-4
 ```
 
-- `baseaddr[4]` → 配列内だが ioremap されていない
-- `DataLinklock[4]` → 配列内だが spin_lock_init されていない（4-link カードでは 0-3 のみ初期化）
-- 1-link/2-link カードでは `baseaddr[1]`/`baseaddr[2]` も NULL → 確実にクラッシュ
+- `baseaddr[4]` → within array bounds but not ioremap'd
+- `DataLinklock[4]` → within array bounds but spin_lock_init not called (only 0-3 initialized for 4-link cards)
+- On 1-link/2-link cards, `baseaddr[1]`/`baseaddr[2]` are also NULL → guaranteed crash
 
-### Bug 3: [HIGH] IOCTL_SEND のセマフォリーク → 永久デッドロック
+### Bug 3: [HIGH] Semaphore Leak in IOCTL_SEND → Permanent Deadlock
 
-**場所:** `a3818_ioctl()` case IOCTL_SEND (a3818.c:1049-1073)
+**Location:** `a3818_ioctl()` case IOCTL_SEND (a3818.c:1049-1073)
 
 ```c
 case IOCTL_SEND:
-    down(&s->ioctl_lock[opt_link]);     // ロック取得
+    down(&s->ioctl_lock[opt_link]);     // Acquire lock
     // ...
     if( readl(...) & A3818_LINK_FAIL ) {
         a3818_reset_comm(s, opt_link);
         mdelay(10);
         if( readl(...) & A3818_LINK_FAIL ) {
             ret = -EACCES;
-            goto err_send;              // ★ up() せずに脱出！
+            goto err_send;              // ★ Exits without calling up()!
         }
     }
     // ... success path ...
-    up(&s->ioctl_lock[opt_link]);       // 正常時はここで解放
+    up(&s->ioctl_lock[opt_link]);       // Released on success
     break;
 
 err_send:
-    break;  // ★ セマフォが永久にロックされたまま → そのリンクは二度と使えない
+    break;  // ★ Semaphore permanently locked → link is unusable forever
 ```
 
-光リンクエラーが1回発生するだけで、そのリンクは永久にデッドロックする。
+A single optical link error permanently deadlocks that link.
 
-### Bug 4: [MEDIUM] IOCTL_RECV のアンバランスなセマフォ
+### Bug 4: [MEDIUM] Unbalanced Semaphore in IOCTL_RECV
 
-**場所:** `a3818_ioctl()` case IOCTL_RECV (a3818.c:1075-1083)
+**Location:** `a3818_ioctl()` case IOCTL_RECV (a3818.c:1075-1083)
 
 ```c
 case IOCTL_RECV:
     if ((s->NumOfLink == 0) && ...)
         return -EFAULT;
     ret = a3818_recv_pkt(s, slave, opt_link, (int *)arg);
-    up(&s->ioctl_lock[opt_link]);   // ★ down() していないのに up()!
+    up(&s->ioctl_lock[opt_link]);   // ★ up() without preceding down()!
     if( ret < 0 ) {
         ret = -EFAULT;
     }
     break;
 ```
 
-呼ぶたびにセマフォカウントが増加 → `ioctl_lock` が排他制御として機能しなくなる → IOCTL_COMM の同時実行でハードウェア状態破壊、データ破壊の可能性。
+Each call increments the semaphore count → `ioctl_lock` no longer provides mutual exclusion → concurrent IOCTL_COMM execution may corrupt hardware state and data.
 
-### Bug 5: [MEDIUM] 0xFFFFFFFF 読み取り後のデッドデバイスアクセス
+### Bug 5: [MEDIUM] Dead Device Access After 0xFFFFFFFF Read
 
-**場所:** `a3818_recv_pkt()` (a3818.c:394-411)
+**Location:** `a3818_recv_pkt()` (a3818.c:394-411)
 
 ```c
 tr_stat = readl(s->baseaddr[opt_link] + A3818_LINK_TRS);
 if( tr_stat == 0xFFFFFFFF ) {
     DPRINTK("rcv-pkt: Error: tr_stat = %x\n", s->tr_stat[opt_link]);
-    break;  // ★ 内部ループを抜けるだけ — エラー状態を設定しない
+    break;  // ★ Only breaks inner loop — does not set error state
 }
-// ... ループ後 ...
+// ... after loop ...
 if (!startDMA) ENABLE_RX_INT(opt_link);
-// ★ ENABLE_RX_INT は writel() → 死んだデバイスに書き込み → Machine Check Exception
+// ★ ENABLE_RX_INT calls writel() → write to dead device → Machine Check Exception
 ```
 
-PCIe デバイスが応答しない状態（0xFFFFFFFF = デバイス消失）で writel すると MCE → カーネルパニック。
+When a PCIe device is unresponsive (0xFFFFFFFF = device gone), writel causes MCE → kernel panic.
 
-### Bug 7: [CRITICAL] `a3818_open()` の spin_lock + msleep → scheduling while atomic
+### Bug 7: [CRITICAL] spin_lock + msleep in `a3818_open()` → scheduling while atomic
 
-**場所:** `a3818_open()` (a3818.c:784-790)
-**発見日:** 2026-03-05
-**発見契機:** 172.18.4.76 が 2026-03-04 17:54 にフリーズ。翌日の再起動でも segfault。
+**Location:** `a3818_open()` (a3818.c:784-790)
+**Discovered:** 2026-03-05
+**Trigger:** Host 172.18.4.76 froze on 2026-03-04 17:54. Segfault on reboot the next day.
 
 ```c
 if( s->TypeOfBoard == A3818BOARD ) {
     if (!s->GTPReset) {
         spin_lock( &s->CardLock);                      // ★ preempt_count += 1
-        if (a3818_reset_onopen(s) == A3818_OK)         // ★ 内部で msleep(10) + msleep(1)!
+        if (a3818_reset_onopen(s) == A3818_OK)         // ★ calls msleep(10) + msleep(1) internally!
             s->GTPReset = 1;
         spin_unlock( &s->CardLock);
     }
 }
 ```
 
-**メカニズム:**
-- `spin_lock()` は preemption を無効化する (preempt_count > 0 → "atomic" コンテキスト)
-- `a3818_reset_onopen()` 内で `msleep(10)` + `msleep(1)` を呼ぶ
-- `msleep()` → `schedule()` → カーネルが preempt_count > 0 を検出 → `BUG: scheduling while atomic`
-- さらに `spin_lock` (IRQ 無効化なし) なので、同一 CPU で IRQ が発火すると CardLock デッドロック
+**Mechanism:**
+- `spin_lock()` disables preemption (preempt_count > 0 → "atomic" context)
+- `a3818_reset_onopen()` calls `msleep(10)` + `msleep(1)` internally
+- `msleep()` → `schedule()` → kernel detects preempt_count > 0 → `BUG: scheduling while atomic`
+- Additionally, `spin_lock` (without IRQ disable) allows IRQs on the same CPU → CardLock deadlock
 
-**再現シナリオ (再接続ストーム):**
-1. A3818 光リンク一時障害 → 10/12 Reader が同時に CAEN error -6
-2. 30s トランジエントエラーリトライ失敗 → 全 Reader が Error 遷移 → connection = None
-3. 1 秒間隔の再接続ループで全 Reader が `a3818_open()` → `spin_lock` + `msleep` を並列実行
-4. `BUG: scheduling while atomic` → workqueue CPU hogging → RT throttling → システムフリーズ
+**Reproduction scenario (reconnection storm):**
+1. A3818 optical link transient failure → 10/12 Readers simultaneously get CAEN error -6
+2. 30s transient error retry fails → all Readers transition to Error → connection = None
+3. Reconnection loop at 1s intervals → all Readers call `a3818_open()` → `spin_lock` + `msleep` in parallel
+4. `BUG: scheduling while atomic` → workqueue CPU hogging → RT throttling → system freeze
 
-**実測データ (2026-03-05 dmesg):**
+**Observed data (2026-03-05 dmesg):**
 ```
 BUG: scheduling while atomic: tokio-runtime-w/26020/0x00000002
  a3818_open+0x176/0x3d0 [a3818]
@@ -187,57 +187,57 @@ BUG: scheduling while atomic: tokio-runtime-w/26050/0x00000002
  a3818_open+0x176/0x3d0 [a3818]
 BUG: scheduling while atomic: tokio-runtime-w/26085/0x00000002
  ...
-a3818: rcv-pkt: Timeout on RX -> Link 0  (6回、回復せず)
+a3818: rcv-pkt: Timeout on RX -> Link 0  (6 times, never recovered)
 ```
 
-**修正:** `v1.6.12-delila2` で対応
-- `CardLock` (spinlock) → 専用 `GTPResetMutex` (mutex) に変更
-- Mutex はスリープ可能 → `msleep` が安全に呼べる
-- IRQ ハンドラは `CardLock` を使い続ける (変更なし)
-- Double-checked locking で GTPReset の一回限り実行を保証
+**Fix:** Addressed in `v1.6.12-delila2`
+- Changed `CardLock` (spinlock) → dedicated `GTPResetMutex` (mutex)
+- Mutex allows sleeping → `msleep` can be called safely
+- IRQ handler continues to use `CardLock` (unchanged)
+- Double-checked locking ensures GTPReset runs only once
 
-### Bug 6: [LOW] `a3818_mmiowb()` が空定義
+### Bug 6: [LOW] `a3818_mmiowb()` is a No-op
 
-**場所:** a3818.c:64
+**Location:** a3818.c:64
 
 ```c
-#define a3818_mmiowb()  // 何もしない
+#define a3818_mmiowb()  // does nothing
 ```
 
-MMIO 書き込み後のオーダリングバリアがない。x86 では通常問題にならないが（強い順序保証がある）、DMA レジスタ設定後に DMA 開始する場合のレースの可能性がある。
+No ordering barrier after MMIO writes. Usually not a problem on x86 (strong ordering guarantees), but there is a potential race when setting up DMA registers followed by DMA start.
 
 ---
 
-## ロックオーダリング分析
+## Lock Ordering Analysis
 
 ```
-割り込みハンドラ:
+Interrupt handler:
   spin_lock(&CardLock)           → Lock A
     spin_lock(&DataLinklock[i])  → Lock B
     spin_unlock(&DataLinklock[i])
   spin_unlock(&CardLock)
 
 recv_pkt:
-  spin_lock_irq(&DataLinklock[i])  → Lock B (IRQ 無効)
-    // ポーリング + handle_rx_pkt
+  spin_lock_irq(&DataLinklock[i])  → Lock B (IRQs disabled)
+    // polling + handle_rx_pkt
   spin_unlock_irq(&DataLinklock[i])
   // ENABLE_RX_INT
-  wait_event_interruptible_timeout(...)  // スリープ
+  wait_event_interruptible_timeout(...)  // sleep
 ```
 
-Lock B → Lock A の逆順はないため AB-BA デッドロックは発生しない。ただし SMP 環境で以下の競合がある:
-- CPU0: recv_pkt が DataLinklock を保持中に DMA 開始
-- CPU1: DMA 完了割り込み → CardLock 取得 → DataLinklock 取得試行 → スピン待ち
-- CPU0 が DataLinklock 解放するまで CPU1 はスピン → デッドロックではないが高レートで性能劣化
+No B → A reverse ordering exists, so AB-BA deadlock does not occur. However, in SMP environments the following contention exists:
+- CPU0: recv_pkt holds DataLinklock and starts DMA
+- CPU1: DMA completion interrupt → acquires CardLock → attempts to acquire DataLinklock → spins
+- CPU1 spins until CPU0 releases DataLinklock → not a deadlock but causes performance degradation at high rates
 
 ---
 
-## 推奨対策
+## Recommended Fixes
 
-### 優先度 1: バッファオーバーフロー修正
+### Priority 1: Buffer Overflow Fix
 
 ```c
-// a3818_dispatch_pkt() 内、memcpy の前に追加:
+// Add before memcpy in a3818_dispatch_pkt():
 #define APP_DMA_IN_SIZE (1024 * 1024)
 
 pos = s->pos_app_dma_in[opt_link][slave];
@@ -245,84 +245,66 @@ int bytes_to_copy = pkt_sz * 2;
 if (pos + bytes_to_copy > APP_DMA_IN_SIZE) {
     printk(KERN_ERR PFX "Buffer overflow prevented on link %d slave %d (pos=%d, copy=%d)\n",
            opt_link, slave, pos, bytes_to_copy);
-    return;  // パケットを破棄
+    return;  // drop the packet
 }
 memcpy(&(iobuf[pos]), &(buff_dma_in[i]), bytes_to_copy);
 ```
 
-さらに、バッファサイズを増大:
+Additionally, increase the buffer size:
 ```c
-// a3818_init_board() の vmalloc を変更:
-// 変更前:
+// Change vmalloc in a3818_init_board():
+// Before:
 s->app_dma_in[i][j] = (u8 *)vmalloc(1024*1024);
-// 変更後:
+// After:
 s->app_dma_in[i][j] = (u8 *)vmalloc(16*1024*1024);  // 16MB
 ```
 
-### 優先度 2: ループ修正
+### Priority 2: Loop Fix
 
 ```c
-// 変更前:
+// Before:
 for( i = s->NumOfLink; i > -1 ; i-- ) {
-// 変更後:
+// After:
 for( i = s->NumOfLink - 1; i >= 0 ; i-- ) {
 ```
 
-### 優先度 3: セマフォ修正
+### Priority 3: Semaphore Fixes
 
-**IOCTL_SEND の err_send:**
+**IOCTL_SEND err_send:**
 ```c
 err_send:
-    up(&s->ioctl_lock[opt_link]);  // 追加
+    up(&s->ioctl_lock[opt_link]);  // added
     break;
 ```
 
-**IOCTL_RECV の余分な up() 削除:**
+**Remove spurious up() in IOCTL_RECV:**
 ```c
 case IOCTL_RECV:
     if ((s->NumOfLink == 0) && ...)
         return -EFAULT;
     ret = a3818_recv_pkt(s, slave, opt_link, (int *)arg);
-    // up(&s->ioctl_lock[opt_link]);  // 削除
+    // up(&s->ioctl_lock[opt_link]);  // removed
     if( ret < 0 ) {
         ret = -EFAULT;
     }
     break;
 ```
 
-### 優先度 4: 0xFFFFFFFF 検出時の即時エラー
+### Priority 4: Immediate Error on 0xFFFFFFFF Detection
 
 ```c
-// a3818_recv_pkt() 内:
+// In a3818_recv_pkt():
 tr_stat = readl(s->baseaddr[opt_link] + A3818_LINK_TRS);
 if( tr_stat == 0xFFFFFFFF ) {
     printk(KERN_ERR PFX "PCIe device failure on link %d\n", opt_link);
     spin_unlock_irq(&s->DataLinklock[opt_link]);
-    return -EIO;  // writel() に到達させない
+    return -EIO;  // prevent reaching writel()
 }
 ```
 
-### 優先度 5: ユーザースペース側の緩和策
+### Priority 5: Userspace Mitigations
 
-ドライバを修正できない場合の暫定対策:
-- リードアウト間隔を短くして 1回のデータ量を 1MB 以下に抑える（50ms 以下推奨）
-- 波形データ取得を高レート時は無効にする
-- EventsPerInterrupt / BLT_SIZE を調整して DMA 転送頻度を下げる
-
----
-
-## 参考情報
-
-### 他プロジェクトでの類似問題
-
-- **FSUDAQ** (FSU DAQ framework): A3818 Driver v1.6.8 で高入力レート (>60kHz) 時のパイルアップとエラーを報告
-- **Kodiaq** (XENON experiment): A3818/V1724 セットアップで segfault と "insufficient BLT buffer size" を報告
-- **MIDAS DAQ**: ドライバ内に `#define USE_MIDAS 0/1` の切り替えがあり、`wait_event_timeout`（シグナル無視）を使用するモードが存在。シグナルによる中断を防止する目的。
-
-### CAEN サポートへの報告推奨事項
-
-以下の情報と共に CAEN サポート (support.computing@caen.it) にバグレポートを送ることを推奨:
-1. `a3818_dispatch_pkt()` のバッファ境界チェック欠如
-2. 割り込みハンドラのループ off-by-one
-3. IOCTL_SEND/IOCTL_RECV のセマフォバグ
-4. カーネルパニックの再現条件（DT5730B, PSD FW, >500K events/s）
+Interim measures if the driver cannot be patched:
+- Shorten readout interval to keep per-cycle data under 1MB (50ms or less recommended)
+- Disable waveform acquisition at high rates
+- Adjust EventsPerInterrupt / BLT_SIZE to reduce DMA transfer frequency
