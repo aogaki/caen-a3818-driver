@@ -24,13 +24,14 @@
 #define DRIVER_DESC "CAEN A3818 PCI Express CONET2 board driver"
 
 /*
- * DELILA patches (2026-02-24):
+ * DELILA patches (v1.6.12-delila2, 2026-03-05):
  *   1. Increase app_dma_in buffer from 1MB to 16MB (prevent overflow at high event rates)
  *   2. Add bounds check in a3818_dispatch_pkt before memcpy
  *   3. Fix off-by-one in interrupt handler loop (i=NumOfLink -> i=NumOfLink-1)
  *   4. Fix semaphore leak in IOCTL_SEND err_send path
  *   5. Fix unbalanced semaphore up() in IOCTL_RECV
  *   6. Handle 0xFFFFFFFF PCIe read in recv_pkt (prevent writel to dead device)
+ *   7. Fix scheduling-while-atomic in a3818_open: spin_lock→mutex for GTP reset (msleep safe)
  * See docs/a3818_driver_analysis.md for full analysis.
  */
 #define APP_DMA_IN_SIZE (16*1024*1024)
@@ -65,6 +66,7 @@
 #include <linux/delay.h>
 #include <linux/ioctl.h>
 #include <linux/sched.h>
+#include <linux/mutex.h>  /* DELILA patch: for GTPResetMutex in a3818_open */
 #include "a3818.h"
 
 /*
@@ -782,10 +784,18 @@ static int a3818_open(struct inode *inode, struct file *file) {
 	}
 		
 	if( s->TypeOfBoard == A3818BOARD ) {
+		/* DELILA patch: a3818_reset_onopen() calls msleep(), which must NOT
+		   be called under spin_lock (BUG: scheduling while atomic).
+		   Use mutex + double-checked locking instead. The IRQ handler
+		   (a3818_interrupt) uses CardLock separately and is safe during
+		   GTP reset — it checks for 0xFFFFFFFF and skips if hardware
+		   is in reset state. */
 		if (!s->GTPReset) {
-			spin_lock( &s->CardLock);
-			if (a3818_reset_onopen(s) == A3818_OK) s->GTPReset = 1;
-			spin_unlock( &s->CardLock);
+			mutex_lock( &s->GTPResetMutex);
+			if (!s->GTPReset) {
+				if (a3818_reset_onopen(s) == A3818_OK) s->GTPReset = 1;
+			}
+			mutex_unlock( &s->GTPResetMutex);
 		}
 	}
 	
@@ -1382,11 +1392,13 @@ static int a3818_init_board(struct pci_dev *pcidev, int index) {
 	  devs = s;
 	  spin_lock_init( &s->DataLinklock[0]);
 	  spin_lock_init( &s->CardLock);
+	  mutex_init( &s->GTPResetMutex);  /* DELILA patch */
 	  printk("Raw PCIe Board\n");
 	  return ret;
 	}
 	
 	spin_lock_init( &s->CardLock);
+	mutex_init( &s->GTPResetMutex);  /* DELILA patch */
 	for( i = 0; i < s->NumOfLink; i++ ) {
 	  spin_lock_init( &s->DataLinklock[i]);
 	  s->ioctls[i] = 0;

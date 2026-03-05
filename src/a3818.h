@@ -15,6 +15,8 @@
 #ifndef _a3818_H
 #define _a3818_H
 
+#include <linux/mutex.h>  /* DELILA patch: for GTPResetMutex */
+
 #ifndef VERSION
 	#define VERSION(ver,rel,seq) (((ver)<<16) | ((rel)<<8) | (seq))
 #endif
@@ -221,6 +223,7 @@ struct a3818_state {
         uint32_t                 tr_stat[MAX_OPT_LINK];
         unsigned int             ioctls[MAX_OPT_LINK];
         unsigned char			 GTPReset;
+		struct mutex			 GTPResetMutex;  /* DELILA patch: sleep-safe lock for GTP reset in open() */
 		unsigned char			 LocalInterrupt[MAX_OPT_LINK];
 		unsigned char			 DMADone[MAX_OPT_LINK];
         unsigned int             DMAInProgress[MAX_OPT_LINK];
